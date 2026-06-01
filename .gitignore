@@ -1,0 +1,6 @@
+/.build/
+/.swiftpm/
+/CodexBar/
+/CodexBarLite.app/
+
+.DS_Store
