@@ -84,7 +84,11 @@ final class UsageMonitor {
     }
 
     private func apply(provider: ProviderID, state: ProviderState) {
-        states[provider] = state
+        // Assign new dictionary to trigger @Observable mutation tracking.
+        var newStates = states
+        newStates[provider] = state
+        states = newStates
+        
         guard case let .success(usage) = state else { return }
         for kind in WindowKind.allCases {
             notifier.process(provider: provider, kind: kind, window: usage.window(kind))
