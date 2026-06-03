@@ -106,13 +106,4 @@ final class UsageMonitor {
         }
     }
 
-    /// Worst (lowest) remaining fraction across all 5-hour windows, 0...1, for
-    /// the menu-bar icon. `nil` when nothing has loaded yet.
-    var worstRemainingFraction: Double? {
-        let remainings = states.values
-            .compactMap(\.usage)
-            .compactMap { $0.fiveHour?.remainingPercent }
-        guard let min = remainings.min() else { return nil }
-        return min / 100.0
-    }
 }

@@ -1,45 +1,96 @@
 import AppKit
 
-/// Draws the menu-bar glyph: a ring whose filled wedge represents the most
-/// constrained remaining capacity across both subs. Rendered as a template image
-/// so it adapts to light/dark menu bars automatically.
+/// Draws the menu-bar glyph: N concentric rings (Apple Fitness style), one per
+/// provider. Radii are computed dynamically so 1, 2, or 3 providers all look
+/// balanced. Non-template so colours are always visible.
 enum MenuBarIcon {
-    static func image(remaining: Double?) -> NSImage {
+    /// Build the icon from the current states dictionary.
+    static func image(states: [ProviderID: ProviderState]) -> NSImage {
         let size = NSSize(width: 18, height: 18)
         let image = NSImage(size: size)
         image.lockFocus()
 
-        let inset: CGFloat = 2
-        let rect = NSRect(origin: .zero, size: size).insetBy(dx: inset, dy: inset)
-        let center = NSPoint(x: rect.midX, y: rect.midY)
-        let radius = rect.width / 2
+        let center = NSPoint(x: 9, y: 9)
+        let providers = Array(ProviderID.allCases.prefix(3))
+        let radii = self.radii(for: providers.count)
+        let lineWidth: CGFloat = 2
+        let trackColor = NSColor(white: 0.5, alpha: 1)
 
-        NSColor.black.set()
+        for (i, id) in providers.enumerated() {
+            let r = radii[i]
+            drawTrack(center: center, radius: r, lineWidth: lineWidth, color: trackColor)
 
-        // Track: thin outline circle.
-        let track = NSBezierPath(ovalIn: rect)
-        track.lineWidth = 1.5
-        track.stroke()
-
-        // Filled wedge for remaining capacity (clockwise from 12 o'clock).
-        if let remaining {
-            let fraction = max(0, min(1, remaining))
-            if fraction > 0 {
-                let wedge = NSBezierPath()
-                wedge.move(to: center)
-                wedge.appendArc(
-                    withCenter: center,
-                    radius: radius - 0.75,
-                    startAngle: 90,
-                    endAngle: 90 - 360 * fraction,
-                    clockwise: true)
-                wedge.close()
-                wedge.fill()
+            let fraction: Double?
+            if case let .success(usage) = states[id],
+               let pct = usage.fiveHour?.remainingPercent {
+                fraction = pct / 100.0
+            } else {
+                fraction = nil
             }
+            drawRing(center: center, radius: r, lineWidth: lineWidth,
+                     fraction: fraction, color: color(for: id))
         }
 
         image.unlockFocus()
-        image.isTemplate = true
+        image.isTemplate = false
         return image
+    }
+
+    /// Radii for 1…3 providers. Outer ring is ~6.5, subsequent rings step inward
+    /// by ~2 pt to keep visible separation at 18×18.
+    private static func radii(for count: Int) -> [CGFloat] {
+        switch count {
+        case 1:  [5.5]
+        case 2:  [6.5, 4]
+        case 3:  [6.5, 4.5, 2.5]
+        default: []
+        }
+    }
+
+    /// Per-provider colours (Apple Fitness palette).
+    private static func color(for provider: ProviderID) -> NSColor {
+        switch provider {
+        case .codex:  NSColor(red: 1, green: 0.18, blue: 0.33, alpha: 1)
+        case .claude: NSColor(red: 0.30, green: 0.85, blue: 0.39, alpha: 1)
+        }
+    }
+
+    /// Full background ring (track) so the outline is visible even at 0 %.
+    private static func drawTrack(center: NSPoint, radius: CGFloat, lineWidth: CGFloat,
+                                  color: NSColor)
+    {
+        color.setStroke()
+        let rect = NSRect(x: center.x - radius, y: center.y - radius,
+                          width: radius * 2, height: radius * 2)
+        let path = NSBezierPath(ovalIn: rect)
+        path.lineWidth = lineWidth
+        path.stroke()
+    }
+
+    /// Draw one incomplete ring (arc with rounded caps) from 12 o'clock clockwise.
+    /// Full coverage is drawn as a complete oval to avoid a visible seam at the caps.
+    private static func drawRing(center: NSPoint, radius: CGFloat, lineWidth: CGFloat,
+                                  fraction: Double?, color: NSColor)
+    {
+        guard let fraction, fraction > 0.001 else { return }
+        color.setStroke()
+
+        if fraction >= 0.999 {
+            let rect = NSRect(x: center.x - radius, y: center.y - radius,
+                              width: radius * 2, height: radius * 2)
+            let path = NSBezierPath(ovalIn: rect)
+            path.lineWidth = lineWidth
+            path.stroke()
+        } else {
+            let path = NSBezierPath()
+            path.appendArc(withCenter: center,
+                           radius: radius,
+                           startAngle: 90,
+                           endAngle: 90 - 360 * fraction,
+                           clockwise: true)
+            path.lineWidth = lineWidth
+            path.lineCapStyle = .round
+            path.stroke()
+        }
     }
 }

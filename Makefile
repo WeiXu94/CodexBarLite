@@ -13,7 +13,9 @@ app:
 	./Scripts/build-app.sh
 
 # Build the .app and install it into /Applications.
-install: app
+# Set SKIP_BUILD=1 to skip building (e.g. after tweaking the icon).
+install:
+	@if [ -z "$(SKIP_BUILD)" ]; then $(MAKE) app; fi
 	@pkill -x CodexBarLite 2>/dev/null || true
 	rm -rf /Applications/CodexBarLite.app
 	cp -R .build/app/CodexBarLite.app /Applications/

@@ -11,7 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.image = MenuBarIcon.image(remaining: nil)
+        statusItem.button?.image = MenuBarIcon.image(states: monitor.states)
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePopover)
 
@@ -49,10 +49,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Keep the menu-bar glyph in sync with the most-constrained window.
+    /// Keep the menu-bar glyph in sync with provider states.
     private func observeIcon() {
         withObservationTracking {
-            statusItem.button?.image = MenuBarIcon.image(remaining: monitor.worstRemainingFraction)
+            statusItem.button?.image = MenuBarIcon.image(states: monitor.states)
         } onChange: {
             Task { @MainActor [weak self] in self?.observeIcon() }
         }
