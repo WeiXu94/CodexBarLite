@@ -19,6 +19,7 @@ final class UsageMonitor {
 
     @ObservationIgnored private let notifier = Notifier()
     @ObservationIgnored private var timer: Timer?
+    @ObservationIgnored private var resetTimer: Timer?
     @ObservationIgnored private var inFlight: Set<ProviderID> = []
 
     /// How often to poll in the background. Persisted in UserDefaults.
@@ -88,10 +89,29 @@ final class UsageMonitor {
         var newStates = states
         newStates[provider] = state
         states = newStates
+
+        scheduleResetRefresh()
         
         guard case let .success(usage) = state else { return }
         for kind in WindowKind.allCases {
             notifier.process(provider: provider, kind: kind, window: usage.window(kind))
+        }
+    }
+
+    /// Arm a one-shot refresh at the next window reset (+ a small buffer so the
+    /// server has actually rolled over), so the ring updates the moment a limit
+    /// resets instead of waiting for the next periodic poll or a popover open.
+    /// Re-armed on every apply, so it always tracks the nearest upcoming reset.
+    /// (A one-shot timer whose fire date passes during sleep also fires on wake.)
+    private func scheduleResetRefresh() {
+        resetTimer?.invalidate()
+        let resets = states.values
+            .compactMap(\.usage)
+            .flatMap { usage in WindowKind.allCases.compactMap { usage.window($0)?.resetsAt } }
+        guard let next = resets.filter({ $0 > Date() }).min() else { return }
+        let interval = max(1, next.timeIntervalSinceNow + 15)
+        resetTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
         }
     }
 

@@ -28,6 +28,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             selector: #selector(screenParametersChanged),
             name: NSApplication.didChangeScreenParametersNotification,
             object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(systemDidWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil)
         monitor.start()
     }
 
@@ -35,6 +40,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// notched built-in screen). Rebuild the icon so it re-reads the new thickness.
     @objc private func screenParametersChanged() {
         statusItem.button?.image = MenuBarIcon.image(states: monitor.states)
+    }
+
+    /// Timers are suspended during sleep, so after waking the data is likely
+    /// stale (a limit may have reset while asleep). Re-fetch so the ring catches
+    /// up immediately rather than at the next periodic poll.
+    @objc private func systemDidWake() {
+        monitor.refresh()
     }
 
     @objc private func togglePopover() {

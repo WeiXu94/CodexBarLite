@@ -22,6 +22,10 @@ final class Notifier {
     /// only notify on the transition into the depleted state.
     private var depleted: [String: Bool] = [:]
 
+    /// The reset time we currently have a reminder scheduled for, per window. Lets
+    /// us re-arm when the provider moves the reset time while still depleted.
+    private var scheduledReset: [String: Date] = [:]
+
     func requestAuthorization() {
         center?.requestAuthorization(options: [.alert, .sound]) { [weak self] granted, _ in
             Task { @MainActor in self?.authorized = granted }
@@ -36,17 +40,23 @@ final class Notifier {
         let wasDepleted = depleted[key] ?? false
         depleted[key] = isDepleted
 
-        guard isDepleted != wasDepleted else { return }
-
         if isDepleted {
-            postReached(provider: provider, kind: kind)
-            scheduleReset(provider: provider, kind: kind, at: window.resetsAt, key: key)
-        } else {
+            // "Limit reached" fires only on entry into the depleted state.
+            if !wasDepleted { postReached(provider: provider, kind: kind) }
+            // (Re)schedule the reset reminder whenever the reported reset time
+            // differs from what's pending — e.g. the provider moves the reset
+            // earlier (model launch, server fix) while the window stays depleted.
+            // scheduleReset cancels the stale request before adding the new one.
+            if scheduledReset[key] != window.resetsAt {
+                scheduleReset(provider: provider, kind: kind, at: window.resetsAt, key: key)
+            }
+        } else if wasDepleted {
             // Limit reset (early or natural): the scheduled reminder is no
             // longer valid because the limit is already reset. Cancel it and
             // post the "limit reset" notification immediately so the user
             // is alerted now, not at the stale scheduled time.
             center?.removePendingNotificationRequests(withIdentifiers: [key])
+            scheduledReset[key] = nil
             postReset(provider: provider, kind: kind)
         }
     }
@@ -91,6 +101,7 @@ final class Notifier {
 
     private func scheduleReset(provider: ProviderID, kind: WindowKind, at date: Date?, key: String) {
         center?.removePendingNotificationRequests(withIdentifiers: [key])
+        scheduledReset[key] = date
         guard let date, date > Date() else { return }
 
         let content = UNMutableNotificationContent()
