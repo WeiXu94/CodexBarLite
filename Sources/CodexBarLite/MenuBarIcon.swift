@@ -69,28 +69,49 @@ enum MenuBarIcon {
 
     /// Draw one incomplete ring (arc with rounded caps) from 12 o'clock clockwise.
     /// Full coverage is drawn as a complete oval to avoid a visible seam at the caps.
+    ///
+    /// Round caps extend `lineWidth/2` past each geometric endpoint along the arc,
+    /// which would otherwise make the *visible* arc longer than `fraction`. We trim
+    /// the drawn arc by that half-cap angle on both ends so the rendered arc (caps
+    /// included) spans exactly `fraction` of the circle.
     private static func drawRing(center: NSPoint, radius: CGFloat, lineWidth: CGFloat,
                                   fraction: Double?, color: NSColor)
     {
         guard let fraction, fraction > 0.001 else { return }
-        color.setStroke()
 
         if fraction >= 0.999 {
+            color.setStroke()
             let rect = NSRect(x: center.x - radius, y: center.y - radius,
                               width: radius * 2, height: radius * 2)
             let path = NSBezierPath(ovalIn: rect)
             path.lineWidth = lineWidth
             path.stroke()
-        } else {
-            let path = NSBezierPath()
-            path.appendArc(withCenter: center,
-                           radius: radius,
-                           startAngle: 90,
-                           endAngle: 90 - 360 * fraction,
-                           clockwise: true)
-            path.lineWidth = lineWidth
-            path.lineCapStyle = .round
-            path.stroke()
+            return
         }
+
+        let arcDeg = 360 * CGFloat(fraction)
+        let capDeg = (lineWidth / 2) / radius * (180 / .pi)   // angular half-cap
+
+        // Too short to trim — the two caps would meet/overlap. Draw a single dot
+        // at 12 o'clock so a near-empty ring still reads as "a sliver left".
+        guard arcDeg > 2 * capDeg else {
+            color.setFill()
+            let dot = NSBezierPath(ovalIn: NSRect(x: center.x - lineWidth / 2,
+                                                  y: center.y + radius - lineWidth / 2,
+                                                  width: lineWidth, height: lineWidth))
+            dot.fill()
+            return
+        }
+
+        color.setStroke()
+        let path = NSBezierPath()
+        path.appendArc(withCenter: center,
+                       radius: radius,
+                       startAngle: 90 - capDeg,
+                       endAngle: 90 - arcDeg + capDeg,
+                       clockwise: true)
+        path.lineWidth = lineWidth
+        path.lineCapStyle = .round
+        path.stroke()
     }
 }
