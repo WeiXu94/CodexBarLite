@@ -42,9 +42,12 @@ final class Notifier {
             postReached(provider: provider, kind: kind)
             scheduleReset(provider: provider, kind: kind, at: window.resetsAt, key: key)
         } else {
-            // Reset already happened and we caught it on a poll before the timer
-            // fired — cancel the now-redundant scheduled reminder.
+            // Limit reset (early or natural): the scheduled reminder is no
+            // longer valid because the limit is already reset. Cancel it and
+            // post the "limit reset" notification immediately so the user
+            // is alerted now, not at the stale scheduled time.
             center?.removePendingNotificationRequests(withIdentifiers: [key])
+            postReset(provider: provider, kind: kind)
         }
     }
 
@@ -58,6 +61,34 @@ final class Notifier {
         deliver(content, identifier: "\(provider.rawValue).\(kind.rawValue).reached")
     }
 
+    private func postReset(provider: ProviderID, kind: WindowKind) {
+        let prefix = "\(provider.rawValue).\(kind.rawValue)"
+        let identifier = "\(prefix).reset"
+        // Within this window we treat any reset banner (scheduled or
+        // immediate) as the same event — covers the natural-reset race where
+        // the scheduled notification fires moments before the poll that would
+        // also post an immediate. Anything older belongs to a previous cycle
+        // and is a different event.
+        let dedupWindow: TimeInterval = 5 * 60
+        center?.getDeliveredNotifications { [weak self] delivered in
+            Task { @MainActor in
+                guard let self else { return }
+                let recentlyDelivered = delivered.contains { notification in
+                    let id = notification.request.identifier
+                    guard id == prefix || id == identifier else { return false }
+                    return notification.date.timeIntervalSinceNow > -dedupWindow
+                }
+                guard !recentlyDelivered else { return }
+
+                let content = UNMutableNotificationContent()
+                content.title = "\(provider.displayName) \(kind.shortLabel) limit reset"
+                content.body = "Your \(kind.label) limit just reset — you're good to go."
+                content.sound = .default
+                self.deliver(content, identifier: identifier)
+            }
+        }
+    }
+
     private func scheduleReset(provider: ProviderID, kind: WindowKind, at date: Date?, key: String) {
         center?.removePendingNotificationRequests(withIdentifiers: [key])
         guard let date, date > Date() else { return }
@@ -67,8 +98,10 @@ final class Notifier {
         content.body = "Your \(kind.label) limit just reset — you're good to go."
         content.sound = .default
 
-        let interval = max(1, date.timeIntervalSinceNow)
-        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: interval, repeats: false)
+        let components = Calendar.current.dateComponents(
+            [.year, .month, .day, .hour, .minute, .second],
+            from: date)
+        let trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: false)
         let request = UNNotificationRequest(identifier: key, content: content, trigger: trigger)
         center?.add(request)
     }
