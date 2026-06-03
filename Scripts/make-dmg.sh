@@ -15,7 +15,7 @@ APP="$ROOT/.build/app/CodexBarLite.app"
 STAGING="$ROOT/.build/dmg/CodexBarLite"
 DIST="$ROOT/.build/dist"
 
-"$ROOT/Scripts/build-app.sh" >/dev/null
+"$ROOT/Scripts/build-app.sh"
 
 VERSION="${VERSION:-$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")}"
 DMG="$DIST/CodexBarLite-v$VERSION-$ARCH_LABEL.dmg"
