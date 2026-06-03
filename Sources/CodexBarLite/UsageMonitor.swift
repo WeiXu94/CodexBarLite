@@ -21,19 +21,48 @@ final class UsageMonitor {
     @ObservationIgnored private var timer: Timer?
     @ObservationIgnored private var inFlight: Set<ProviderID> = []
 
-    /// How often to poll in the background.
-    static let refreshInterval: TimeInterval = 5 * 60
+    /// How often to poll in the background. Persisted in UserDefaults.
+    static let defaultRefreshInterval: TimeInterval = 5 * 60
+
+    /// User-configurable refresh interval (seconds). Backed by UserDefaults.
+    var refreshInterval: TimeInterval = {
+        let stored = UserDefaults.standard.double(forKey: "refreshInterval")
+        return stored > 0 ? stored : 5 * 60
+    }() {
+        didSet {
+            UserDefaults.standard.set(refreshInterval, forKey: "refreshInterval")
+            restartTimer()
+        }
+    }
+
+    /// Predefined interval choices for the UI.
+    static let refreshIntervalOptions: [(label: String, value: TimeInterval)] = [
+        ("5 min", 300),
+        ("10 min", 600),
+        ("15 min", 900),
+        ("20 min", 1200),
+        ("30 min", 1800),
+    ]
 
     var isRefreshing: Bool { !inFlight.isEmpty }
 
     func start() {
         notifier.requestAuthorization()
         refresh()
-        let timer = Timer.scheduledTimer(withTimeInterval: Self.refreshInterval, repeats: true) { [weak self] _ in
+        startTimer()
+    }
+
+    private func startTimer() {
+        timer?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
-        timer.tolerance = 30
+        timer.tolerance = min(30, refreshInterval / 10)
         self.timer = timer
+    }
+
+    private func restartTimer() {
+        startTimer()
     }
 
     func refresh() {
@@ -77,13 +106,12 @@ final class UsageMonitor {
         }
     }
 
-    /// Worst (lowest) remaining fraction across all four windows, 0...1, for the
-    /// menu-bar icon. `nil` when nothing has loaded yet.
+    /// Worst (lowest) remaining fraction across all 5-hour windows, 0...1, for
+    /// the menu-bar icon. `nil` when nothing has loaded yet.
     var worstRemainingFraction: Double? {
         let remainings = states.values
             .compactMap(\.usage)
-            .flatMap { [$0.fiveHour, $0.weekly] }
-            .compactMap { $0?.remainingPercent }
+            .compactMap { $0.fiveHour?.remainingPercent }
         guard let min = remainings.min() else { return nil }
         return min / 100.0
     }

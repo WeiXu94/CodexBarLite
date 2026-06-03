@@ -58,6 +58,17 @@ struct ContentView: View {
                     launchAtLogin = LaunchAtLogin.isEnabled
                 }
 
+            Picker("Refresh every", selection: Binding(
+                get: { monitor.refreshInterval },
+                set: { monitor.refreshInterval = $0 }
+            )) {
+                ForEach(UsageMonitor.refreshIntervalOptions, id: \.value) { opt in
+                    Text(opt.label).tag(opt.value)
+                }
+            }
+            .pickerStyle(.menu)
+            .font(.callout)
+
             HStack {
                 if let updated = monitor.lastUpdated {
                     Text("Updated \(updated.formatted(date: .omitted, time: .shortened))")

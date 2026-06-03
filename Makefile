@@ -14,9 +14,10 @@ app:
 
 # Build the .app and install it into /Applications.
 install: app
+	@pkill -x CodexBarLite 2>/dev/null || true
 	rm -rf /Applications/CodexBarLite.app
 	cp -R .build/app/CodexBarLite.app /Applications/
-	@echo "Installed to /Applications/CodexBarLite.app — launch it from Spotlight or Finder."
+	open /Applications/CodexBarLite.app
 
 # Build the .app and package it as a DMG in .build/dist/.
 dmg:
