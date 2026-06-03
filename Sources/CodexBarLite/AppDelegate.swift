@@ -23,7 +23,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentSize = NSSize(width: popoverWidth, height: 200)
 
         observeIcon()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(screenParametersChanged),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil)
         monitor.start()
+    }
+
+    /// The menu-bar thickness can change when displays change (e.g. moving to a
+    /// notched built-in screen). Rebuild the icon so it re-reads the new thickness.
+    @objc private func screenParametersChanged() {
+        statusItem.button?.image = MenuBarIcon.image(states: monitor.states)
     }
 
     @objc private func togglePopover() {
