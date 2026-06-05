@@ -1,4 +1,4 @@
-.PHONY: build run app install dmg clean
+.PHONY: build run app install dmg icon clean
 
 # Debug build.
 build:
@@ -24,6 +24,9 @@ install:
 # Build the .app and package it as a DMG in .build/dist/.
 dmg:
 	./Scripts/make-dmg.sh
+
+icon:
+	python3 Scripts/generate-app-icon.py
 
 clean:
 	swift package clean
