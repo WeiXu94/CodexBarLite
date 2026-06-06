@@ -15,6 +15,8 @@ It reads the credentials the `codex` and `claude` CLIs already store on your Mac
 > This is a from-scratch slim rewrite. The original, full-featured CodexBar lives
 > untouched in the `CodexBar/` subfolder and is used only as reference.
 
+<img src="assets/Screenshot-2026-06-05.png" width="400" alt="Screenshot">
+
 ## Build & install
 
 ```sh
