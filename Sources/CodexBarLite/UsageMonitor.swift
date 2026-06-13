@@ -66,17 +66,20 @@ final class UsageMonitor {
         startTimer()
     }
 
-    func refresh() {
+    /// `interactive` is true for user-initiated refreshes (popover open, manual
+    /// refresh button), which may show the Claude Keychain prompt; the timer,
+    /// wake, and reset-driven polls pass false so they never prompt.
+    func refresh(interactive: Bool = false) {
         for provider in ProviderID.allCases {
-            refresh(provider)
+            refresh(provider, interactive: interactive)
         }
     }
 
-    private func refresh(_ provider: ProviderID) {
+    private func refresh(_ provider: ProviderID, interactive: Bool) {
         guard !inFlight.contains(provider) else { return }
         inFlight.insert(provider)
         Task { [weak self] in
-            let state = await Self.load { try await Self.fetch(provider) }
+            let state = await Self.load { try await Self.fetch(provider, interactive: interactive) }
             guard let self else { return }
             self.apply(provider: provider, state: state)
             self.inFlight.remove(provider)
@@ -115,10 +118,10 @@ final class UsageMonitor {
         }
     }
 
-    private static func fetch(_ provider: ProviderID) async throws -> ProviderUsage {
+    private static func fetch(_ provider: ProviderID, interactive: Bool) async throws -> ProviderUsage {
         switch provider {
         case .codex: try await CodexClient.fetch()
-        case .claude: try await ClaudeClient.fetch()
+        case .claude: try await ClaudeClient.fetch(interactive: interactive)
         }
     }
 

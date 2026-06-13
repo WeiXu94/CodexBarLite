@@ -37,7 +37,7 @@ struct ContentView: View {
             Text("CodexBar Lite").font(.headline)
             Spacer()
             Button {
-                monitor.refresh()
+                monitor.refresh(interactive: true)
             } label: {
                 Image(systemName: "arrow.clockwise")
                     .opacity(monitor.isRefreshing ? 0.4 : 1)

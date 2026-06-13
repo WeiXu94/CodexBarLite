@@ -1,4 +1,6 @@
+import Darwin
 import Foundation
+import LocalAuthentication
 import Security
 
 /// Reads Claude Code usage from the local OAuth credentials that the `claude`
@@ -42,8 +44,11 @@ enum ClaudeClient {
     nonisolated(unsafe) private static var refreshBlockedUntil: Date?
     private static let refreshBackoff: TimeInterval = 15 * 60
 
-    static func fetch() async throws -> ProviderUsage {
-        var creds = try loadCredentials()
+    /// `interactive == true` permits the macOS Keychain access prompt (used for
+    /// user-initiated refreshes); background polls pass `false` so a read that
+    /// would prompt fails silently instead. See `readKeychain` / `suppressPrompt`.
+    static func fetch(interactive: Bool = false) async throws -> ProviderUsage {
+        var creds = try loadCredentials(interactive: interactive)
         if creds.isExpired {
             creds = try await refresh(from: creds)
         }
@@ -127,9 +132,12 @@ enum ClaudeClient {
     /// Refresh the access token and persist the rotated tokens back to their store.
     /// `force` refreshes even if `creds` looks unexpired (used on a 401).
     private static func refresh(from creds: Credentials, force: Bool = false) async throws -> Credentials {
-        // Self-heal: the `claude` CLI may have refreshed the store already.
-        let latest = (try? loadCredentials()) ?? creds
+        // Self-heal: the `claude` CLI may have refreshed the store already. Read
+        // the store directly (bypassing our cache) and non-interactively so we can
+        // pick that up without a prompt.
+        let latest = (try? loadCredentialsFromStore(interactive: false)) ?? creds
         if !latest.isExpired, force ? latest.accessToken != creds.accessToken : true {
+            storeInCache(latest)
             return latest
         }
 
@@ -141,6 +149,7 @@ enum ClaudeClient {
         do {
             let refreshed = try await performRefresh(refreshToken: refreshToken, base: latest)
             persist(refreshed)
+            storeInCache(refreshed)
             refreshBlockedUntil = nil
             return refreshed
         } catch {
@@ -201,7 +210,7 @@ enum ClaudeClient {
             else { return }
             try? blob.write(to: url, options: .atomic)
         case .keychain:
-            guard let existing = readKeychain(),
+            guard let existing = readKeychain(interactive: false),
                   let blob = updatedBlob(existing: existing, creds: creds)
             else { return }
             let query: [String: Any] = [
@@ -244,29 +253,90 @@ enum ClaudeClient {
         }
     }
 
+    /// Returns cached credentials while they're fresh, otherwise reads the store
+    /// and caches the result. The cache means routine polls don't touch the
+    /// Keychain at all (each read is a chance to trip a macOS access prompt).
+    private static func loadCredentials(interactive: Bool) throws -> Credentials {
+        if let cached = cachedCredentials() { return cached }
+        let creds = try loadCredentialsFromStore(interactive: interactive)
+        storeInCache(creds)
+        return creds
+    }
+
     /// Tries the credentials file first (no prompt), then the Keychain.
-    private static func loadCredentials() throws -> Credentials {
+    private static func loadCredentialsFromStore(interactive: Bool) throws -> Credentials {
         let fileURL = credentialsFileURL()
         if let data = try? Data(contentsOf: fileURL), let creds = try? parseCredentials(data, source: .file(fileURL)) {
             return creds
         }
-        if let data = readKeychain(), let creds = try? parseCredentials(data, source: .keychain) {
+        if let data = readKeychain(interactive: interactive), let creds = try? parseCredentials(data, source: .keychain) {
             return creds
         }
         throw ClaudeError.notLoggedIn
+    }
+
+    // MARK: - In-memory credentials cache
+
+    /// How long a cached read is trusted before we go back to the store (long
+    /// enough to skip most polls, short enough to pick up a token the `claude`
+    /// CLI rotated out-of-band).
+    private static let cacheValidity: TimeInterval = 30 * 60
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var cachedCreds: Credentials?
+    nonisolated(unsafe) private static var cachedAt: Date?
+
+    private static func cachedCredentials() -> Credentials? {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        guard let cachedCreds, let cachedAt, Date().timeIntervalSince(cachedAt) < cacheValidity else {
+            return nil
+        }
+        return cachedCreds
+    }
+
+    private static func storeInCache(_ creds: Credentials) {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        cachedCreds = creds
+        cachedAt = Date()
+    }
+
+    // MARK: - Keychain prompt avoidance
+
+    /// Resolved value of the (deprecated) `kSecUseAuthenticationUIFail` constant,
+    /// looked up at runtime so we don't reference deprecated API at compile time.
+    private static let uiFailPolicy: String = {
+        let path = "/System/Library/Frameworks/Security.framework/Security"
+        guard let handle = dlopen(path, RTLD_NOW) else { return "u_AuthUIF" }
+        defer { dlclose(handle) }
+        guard let symbol = dlsym(handle, "kSecUseAuthenticationUIFail") else { return "u_AuthUIF" }
+        return (symbol.assumingMemoryBound(to: CFString?.self).pointee as String?) ?? "u_AuthUIF"
+    }()
+
+    /// Make a Keychain query fail silently (`errSecInteractionNotAllowed`) instead
+    /// of showing the macOS "wants to access" prompt. Once the app is in the
+    /// item's ACL (one "Always Allow"), the read just succeeds with no UI — so
+    /// background polls never prompt and never block.
+    private static func suppressPrompt(_ query: inout [String: Any]) {
+        let context = LAContext()
+        context.interactionNotAllowed = true
+        query[kSecUseAuthenticationContext as String] = context
+        query[kSecUseAuthenticationUI as String] = uiFailPolicy as CFString
     }
 
     private static func credentialsFileURL() -> URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/.credentials.json")
     }
 
-    private static func readKeychain() -> Data? {
-        let query: [String: Any] = [
+    /// Reads the Claude Keychain item. When `interactive` is false the query is
+    /// marked no-UI so a read that would prompt fails silently (returns nil)
+    /// rather than showing the access dialog on every poll.
+    private static func readKeychain(interactive: Bool) -> Data? {
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
             kSecMatchLimit as String: kSecMatchLimitOne,
             kSecReturnData as String: true,
         ]
+        if !interactive { suppressPrompt(&query) }
         var result: AnyObject?
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return nil }
         return result as? Data
