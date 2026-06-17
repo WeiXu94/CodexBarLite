@@ -61,6 +61,17 @@ final class Notifier {
         }
     }
 
+    /// Drop all pending reminders and tracked state for a provider — called when
+    /// the user disables it, so a scheduled reset reminder doesn't fire later.
+    func cancel(provider: ProviderID) {
+        for kind in WindowKind.allCases {
+            let key = "\(provider.rawValue).\(kind.rawValue)"
+            center?.removePendingNotificationRequests(withIdentifiers: [key])
+            scheduledReset[key] = nil
+            depleted[key] = nil
+        }
+    }
+
     // MARK: - Posting
 
     private func postReached(provider: ProviderID, kind: WindowKind) {

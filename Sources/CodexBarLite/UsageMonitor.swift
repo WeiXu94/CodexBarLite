@@ -14,6 +14,17 @@ final class UsageMonitor {
         .codex: .loading,
         .claude: .loading,
     ]
+    /// Whether each provider is enabled. A disabled provider isn't queried and
+    /// its ring is dropped from the menu-bar icon. Persisted in UserDefaults;
+    /// defaults to enabled when no stored value exists.
+    private(set) var enabled: [ProviderID: Bool] = {
+        var result: [ProviderID: Bool] = [:]
+        for provider in ProviderID.allCases {
+            let key = "enabled.\(provider.rawValue)"
+            result[provider] = UserDefaults.standard.object(forKey: key) as? Bool ?? true
+        }
+        return result
+    }()
     /// Last time any refresh completed.
     private(set) var lastUpdated: Date?
 
@@ -70,8 +81,29 @@ final class UsageMonitor {
     /// refresh button), which may show the Claude Keychain prompt; the timer,
     /// wake, and reset-driven polls pass false so they never prompt.
     func refresh(interactive: Bool = false) {
-        for provider in ProviderID.allCases {
+        for provider in ProviderID.allCases where enabled[provider] ?? true {
             refresh(provider, interactive: interactive)
+        }
+    }
+
+    /// Enable or disable a provider. Disabling stops querying it and cancels its
+    /// pending reset reminders; enabling refreshes it immediately. The icon and
+    /// card react via the observed `enabled` map.
+    func setEnabled(_ provider: ProviderID, _ isEnabled: Bool) {
+        guard (enabled[provider] ?? true) != isEnabled else { return }
+        var newEnabled = enabled
+        newEnabled[provider] = isEnabled
+        enabled = newEnabled
+        UserDefaults.standard.set(isEnabled, forKey: "enabled.\(provider.rawValue)")
+
+        if isEnabled {
+            var newStates = states
+            newStates[provider] = .loading
+            states = newStates
+            refresh(provider, interactive: true)
+        } else {
+            notifier.cancel(provider: provider)
+            scheduleResetRefresh()
         }
     }
 
@@ -93,8 +125,12 @@ final class UsageMonitor {
         newStates[provider] = state
         states = newStates
 
+        // A provider disabled mid-flight gets its result recorded but no
+        // notifications or reset scheduling — we no longer track it.
+        guard enabled[provider] ?? true else { return }
+
         scheduleResetRefresh()
-        
+
         guard case let .success(usage) = state else { return }
         for kind in WindowKind.allCases {
             notifier.process(provider: provider, kind: kind, window: usage.window(kind))
@@ -108,8 +144,9 @@ final class UsageMonitor {
     /// (A one-shot timer whose fire date passes during sleep also fires on wake.)
     private func scheduleResetRefresh() {
         resetTimer?.invalidate()
-        let resets = states.values
-            .compactMap(\.usage)
+        let resets = ProviderID.allCases
+            .filter { enabled[$0] ?? true }
+            .compactMap { states[$0]?.usage }
             .flatMap { usage in WindowKind.allCases.compactMap { usage.window($0)?.resetsAt } }
         guard let next = resets.filter({ $0 > Date() }).min() else { return }
         let interval = max(1, next.timeIntervalSinceNow + 15)

@@ -17,7 +17,7 @@ struct ContentView: View {
                 header
 
                 ForEach(ProviderID.allCases, id: \.self) { provider in
-                    ProviderCard(provider: provider, state: monitor.states[provider] ?? .loading)
+                    ProviderCard(monitor: monitor, provider: provider)
                 }
 
                 Divider()
@@ -85,38 +85,55 @@ struct ContentView: View {
 }
 
 private struct ProviderCard: View {
+    @Bindable var monitor: UsageMonitor
     let provider: ProviderID
-    let state: ProviderState
+
+    private var isEnabled: Bool { monitor.enabled[provider] ?? true }
+    private var state: ProviderState { monitor.states[provider] ?? .loading }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 Text(provider.displayName).font(.subheadline.weight(.semibold))
-                if case let .success(usage) = state, let plan = usage.planName {
+                if isEnabled, case let .success(usage) = state, let plan = usage.planName {
                     Text(plan)
                         .font(.caption2)
                         .padding(.horizontal, 5).padding(.vertical, 1)
                         .background(Color.secondary.opacity(0.15), in: Capsule())
                         .foregroundStyle(.secondary)
                 }
+                Spacer()
+                Toggle("", isOn: Binding(
+                    get: { isEnabled },
+                    set: { monitor.setEnabled(provider, $0) }
+                ))
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .help(isEnabled ? "Disable \(provider.displayName)" : "Enable \(provider.displayName)")
             }
 
-            switch state {
-            case .loading:
-                Text("Loading…").font(.caption).foregroundStyle(.secondary)
-            case let .failure(message):
-                Text(message)
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-            case let .success(usage):
-                WindowRow(kind: .fiveHour, window: usage.fiveHour)
-                WindowRow(kind: .weekly, window: usage.weekly)
+            if !isEnabled {
+                Text("Disabled").font(.caption).foregroundStyle(.secondary)
+            } else {
+                switch state {
+                case .loading:
+                    Text("Loading…").font(.caption).foregroundStyle(.secondary)
+                case let .failure(message):
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                case let .success(usage):
+                    WindowRow(kind: .fiveHour, window: usage.fiveHour)
+                    WindowRow(kind: .weekly, window: usage.weekly)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(10)
         .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        .opacity(isEnabled ? 1 : 0.65)
     }
 }
 

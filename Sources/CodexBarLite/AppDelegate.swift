@@ -11,7 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.image = MenuBarIcon.image(states: monitor.states)
+        statusItem.button?.image = MenuBarIcon.image(states: monitor.states, enabled: monitor.enabled)
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePopover)
 
@@ -39,7 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The menu-bar thickness can change when displays change (e.g. moving to a
     /// notched built-in screen). Rebuild the icon so it re-reads the new thickness.
     @objc private func screenParametersChanged() {
-        statusItem.button?.image = MenuBarIcon.image(states: monitor.states)
+        statusItem.button?.image = MenuBarIcon.image(states: monitor.states, enabled: monitor.enabled)
     }
 
     /// Timers are suspended during sleep, so after waking the data is likely
@@ -75,7 +75,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Keep the menu-bar glyph in sync with provider states.
     private func observeIcon() {
         withObservationTracking {
-            statusItem.button?.image = MenuBarIcon.image(states: monitor.states)
+            statusItem.button?.image = MenuBarIcon.image(states: monitor.states, enabled: monitor.enabled)
         } onChange: {
             Task { @MainActor [weak self] in self?.observeIcon() }
         }

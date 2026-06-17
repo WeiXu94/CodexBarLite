@@ -7,10 +7,12 @@ import AppKit
 /// Non-template so colours are always visible.
 enum MenuBarIcon {
     /// Build the icon from the current states dictionary, sized to the menu bar.
-    static func image(states: [ProviderID: ProviderState]) -> NSImage {
+    /// Only enabled providers get a ring; a disabled provider is dropped entirely.
+    static func image(states: [ProviderID: ProviderState],
+                      enabled: [ProviderID: Bool]) -> NSImage {
         let side = NSStatusBar.system.thickness
         let image = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
-            draw(states: states, in: rect)
+            draw(states: states, enabled: enabled, in: rect)
             return true
         }
         image.isTemplate = false
@@ -19,12 +21,21 @@ enum MenuBarIcon {
 
     /// Render the rings into `rect` (the destination the drawing handler hands us,
     /// so all geometry scales to whatever size the system asks to draw).
-    private static func draw(states: [ProviderID: ProviderState], in rect: NSRect) {
+    private static func draw(states: [ProviderID: ProviderState],
+                             enabled: [ProviderID: Bool], in rect: NSRect) {
         let side = min(rect.width, rect.height)
         let center = NSPoint(x: rect.midX, y: rect.midY)
         let lineWidth = max(1.5, side * 0.11)
         let margin = side * 0.03
-        let providers = Array(ProviderID.allCases.prefix(3))
+
+        let providers = Array(ProviderID.allCases.filter { enabled[$0] ?? true }.prefix(3))
+        // Everything off: keep a faint track so the icon stays visible/clickable.
+        guard !providers.isEmpty else {
+            drawTrack(center: center, radius: side / 2 - lineWidth / 2 - margin,
+                      lineWidth: lineWidth, color: NSColor(white: 0.5, alpha: 0.35))
+            return
+        }
+
         let radii = self.radii(count: providers.count, side: side,
                                lineWidth: lineWidth, margin: margin)
         let trackColor = NSColor(white: 0.5, alpha: 1)
