@@ -7,12 +7,13 @@ import Security
 /// CLI stores (Keychain item "Claude Code-credentials", or
 /// `~/.claude/.credentials.json`), then GETs `api.anthropic.com/api/oauth/usage`.
 ///
-/// Auto-refresh: when the token is expired (or rejected), we refresh it via
-/// Anthropic's OAuth token endpoint and write the rotated token back to the same
-/// store we read it from — keeping the app and the `claude` CLI in sync on a
-/// single source of truth (the only safe way to rotate refresh tokens). We never
-/// touch any field other than the access token, refresh token, and expiry, and we
-/// only write when we could read the existing blob, so we can't clobber a login.
+/// **Strictly read-only on credentials.** Unlike the upstream design, this app
+/// never mints, rotates, or writes a token. Rotating the CLI's single-use
+/// refresh token from here could leave `claude` holding a dead token, so the
+/// hard rule is: never do anything that can break Claude Code. When our token is
+/// expired or rejected, we ask the `claude` CLI to refresh *its own* Keychain
+/// token (`claude auth status` — read-only, non-interactive, no usage consumed)
+/// and then re-read the store. The CLI stays the sole owner of the credential.
 enum ClaudeClient {
     enum ClaudeError: LocalizedError {
         case notLoggedIn
@@ -33,16 +34,9 @@ enum ClaudeClient {
     }
 
     private static let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
-    private static let refreshURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
-    private static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     private static let keychainService = "Claude Code-credentials"
     private static let betaHeader = "oauth-2025-04-20"
     private static let userAgent = "claude-code/2.1.0"
-
-    /// After a failed refresh, don't retry until this time (avoids hammering the
-    /// token endpoint with a dead refresh token every poll).
-    nonisolated(unsafe) private static var refreshBlockedUntil: Date?
-    private static let refreshBackoff: TimeInterval = 15 * 60
 
     /// `interactive == true` permits the macOS Keychain access prompt (used for
     /// user-initiated refreshes); background polls pass `false` so a read that
@@ -50,12 +44,14 @@ enum ClaudeClient {
     static func fetch(interactive: Bool = false) async throws -> ProviderUsage {
         var creds = try loadCredentials(interactive: interactive)
         if creds.isExpired {
-            creds = try await refresh(from: creds)
+            creds = try await refreshedViaCLI(stale: creds, interactive: interactive, force: false)
         }
         do {
             return try await fetchUsage(creds)
         } catch ClaudeError.unauthorized {
-            creds = try await refresh(from: creds, force: true)
+            // Token rejected: nudge the CLI once more (bypassing the cooldown),
+            // re-read, and retry. If it still 401s we surface the error.
+            creds = try await refreshedViaCLI(stale: creds, interactive: interactive, force: true)
             return try await fetchUsage(creds)
         }
     }
@@ -127,125 +123,94 @@ enum ClaudeClient {
         }
     }
 
-    // MARK: - Token refresh
+    // MARK: - Delegated refresh (the `claude` CLI owns its token)
 
-    /// Refresh the access token and persist the rotated tokens back to their store.
-    /// `force` refreshes even if `creds` looks unexpired (used on a 401).
-    private static func refresh(from creds: Credentials, force: Bool = false) async throws -> Credentials {
-        // Self-heal: the `claude` CLI may have refreshed the store already. Read
-        // the store directly (bypassing our cache) and non-interactively so we can
-        // pick that up without a prompt.
-        let latest = (try? loadCredentialsFromStore(interactive: false)) ?? creds
-        if !latest.isExpired, force ? latest.accessToken != creds.accessToken : true {
-            storeInCache(latest)
+    /// Don't spawn `claude` on every poll: a token is good for hours, so one
+    /// nudge per this interval is plenty. Bypassed on a hard 401 (`force`).
+    private static let cliCooldown: TimeInterval = 5 * 60
+    private static let cliLock = NSLock()
+    nonisolated(unsafe) private static var lastCLINudgeAt: Date?
+
+    /// Returns the freshest store credentials, having asked the CLI to refresh if
+    /// needed. **Never refreshes in-app.** Falls back to `stale` when the CLI is
+    /// unavailable or hasn't refreshed yet — the caller then surfaces a soft error
+    /// and the next poll retries (and `claude`, used normally, refreshes anyway).
+    private static func refreshedViaCLI(stale: Credentials, interactive: Bool, force: Bool) async throws -> Credentials {
+        // Self-heal: the CLI may have already refreshed the store out-of-band.
+        if let latest = try? reloadFromStore(interactive: interactive), !latest.isExpired {
             return latest
         }
-
-        if let until = refreshBlockedUntil, Date() < until { throw ClaudeError.expired }
-        guard let refreshToken = latest.refreshToken, !refreshToken.isEmpty else {
-            throw ClaudeError.expired
-        }
-
-        do {
-            let refreshed = try await performRefresh(refreshToken: refreshToken, base: latest)
-            persist(refreshed)
-            storeInCache(refreshed)
-            refreshBlockedUntil = nil
-            return refreshed
-        } catch {
-            refreshBlockedUntil = Date().addingTimeInterval(refreshBackoff)
-            throw ClaudeError.expired
-        }
+        await nudgeCLIToRefresh(force: force)
+        return (try? reloadFromStore(interactive: interactive)) ?? stale
     }
 
-    private static func performRefresh(refreshToken: String, base: Credentials) async throws -> Credentials {
-        var request = URLRequest(url: refreshURL)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 30
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        var components = URLComponents()
-        components.queryItems = [
-            URLQueryItem(name: "grant_type", value: "refresh_token"),
-            URLQueryItem(name: "refresh_token", value: refreshToken),
-            URLQueryItem(name: "client_id", value: clientID),
+    /// Runs `claude auth status` so the CLI validates and (if expired) refreshes
+    /// its own Keychain token. Read-only, non-interactive, consumes no usage.
+    /// Cooldown-gated; a no-op (returns false) when `claude` can't be found.
+    @discardableResult
+    private static func nudgeCLIToRefresh(force: Bool) async -> Bool {
+        guard reserveCLINudge(force: force) else { return false }
+        guard let claude = claudeBinaryURL() else { return false }
+        return await runProcess(claude, ["auth", "status"], timeout: 15)
+    }
+
+    /// Claims a nudge slot under the cooldown. Synchronous so the lock is never
+    /// held across an `await`. Returns false when a nudge ran too recently.
+    private static func reserveCLINudge(force: Bool) -> Bool {
+        cliLock.lock(); defer { cliLock.unlock() }
+        if !force, let last = lastCLINudgeAt, Date().timeIntervalSince(last) < cliCooldown {
+            return false
+        }
+        lastCLINudgeAt = Date()
+        return true
+    }
+
+    /// Resolves the `claude` binary. GUI apps inherit a minimal PATH, so probe the
+    /// standard install locations rather than relying on PATH.
+    private static func claudeBinaryURL() -> URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let candidates = [
+            home.appendingPathComponent(".local/bin/claude"),
+            home.appendingPathComponent(".claude/local/claude"),
+            URL(fileURLWithPath: "/opt/homebrew/bin/claude"),
+            URL(fileURLWithPath: "/usr/local/bin/claude"),
         ]
-        request.httpBody = (components.percentEncodedQuery ?? "").data(using: .utf8)
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-            throw ClaudeError.unauthorized
-        }
-        let decoded = try JSONDecoder().decode(RefreshResponse.self, from: data)
-        return Credentials(
-            accessToken: decoded.accessToken,
-            refreshToken: decoded.refreshToken ?? refreshToken,
-            expiresAt: Date(timeIntervalSinceNow: TimeInterval(decoded.expiresIn)),
-            subscriptionType: base.subscriptionType,
-            source: base.source)
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
     }
 
-    private struct RefreshResponse: Decodable {
-        let accessToken: String
-        let refreshToken: String?
-        let expiresIn: Int
+    /// Runs a short-lived helper, discarding its I/O, with a hard timeout so a
+    /// stuck child (e.g. one blocked on a Keychain prompt) can never hang a poll.
+    private static func runProcess(_ url: URL, _ arguments: [String], timeout: TimeInterval) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            let process = Process()
+            process.executableURL = url
+            process.arguments = arguments
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            process.standardInput = FileHandle.nullDevice
 
-        enum CodingKeys: String, CodingKey {
-            case accessToken = "access_token"
-            case refreshToken = "refresh_token"
-            case expiresIn = "expires_in"
+            // Exactly one resume: terminationHandler fires once when the process
+            // exits (including after a timeout `terminate()`); if launch throws,
+            // the handler never fires and we resume in the catch instead.
+            process.terminationHandler = { continuation.resume(returning: $0.terminationStatus == 0) }
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(returning: false)
+                return
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak process] in
+                if process?.isRunning == true { process?.terminate() }
+            }
         }
-    }
-
-    // MARK: - Persisting rotated tokens
-
-    /// Writes the rotated tokens back into the store we read from, mutating only
-    /// the three OAuth fields and preserving everything else. No-op if the
-    /// existing blob can't be read (so a login is never clobbered).
-    private static func persist(_ creds: Credentials) {
-        switch creds.source {
-        case let .file(url):
-            guard let existing = try? Data(contentsOf: url),
-                  let blob = updatedBlob(existing: existing, creds: creds)
-            else { return }
-            try? blob.write(to: url, options: .atomic)
-        case .keychain:
-            guard let existing = readKeychain(interactive: false),
-                  let blob = updatedBlob(existing: existing, creds: creds)
-            else { return }
-            let query: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: keychainService,
-            ]
-            SecItemUpdate(query as CFDictionary, [kSecValueData as String: blob] as CFDictionary)
-        }
-    }
-
-    private static func updatedBlob(existing: Data, creds: Credentials) -> Data? {
-        guard var root = (try? JSONSerialization.jsonObject(with: existing)) as? [String: Any] else {
-            return nil
-        }
-        var oauth = (root["claudeAiOauth"] as? [String: Any]) ?? [:]
-        oauth["accessToken"] = creds.accessToken
-        if let refreshToken = creds.refreshToken { oauth["refreshToken"] = refreshToken }
-        if let expiresAt = creds.expiresAt { oauth["expiresAt"] = expiresAt.timeIntervalSince1970 * 1000 }
-        root["claudeAiOauth"] = oauth
-        return try? JSONSerialization.data(withJSONObject: root)
     }
 
     // MARK: - Credentials
 
-    enum Source {
-        case keychain
-        case file(URL)
-    }
-
     struct Credentials {
         let accessToken: String
-        let refreshToken: String?
         let expiresAt: Date?
         let subscriptionType: String?
-        let source: Source
 
         var isExpired: Bool {
             guard let expiresAt else { return false }
@@ -258,6 +223,13 @@ enum ClaudeClient {
     /// Keychain at all (each read is a chance to trip a macOS access prompt).
     private static func loadCredentials(interactive: Bool) throws -> Credentials {
         if let cached = cachedCredentials() { return cached }
+        return try reloadFromStore(interactive: interactive)
+    }
+
+    /// Reads the store directly (bypassing the cache) and refreshes the cache.
+    /// Used after a CLI nudge so we pick up the newly refreshed token.
+    @discardableResult
+    private static func reloadFromStore(interactive: Bool) throws -> Credentials {
         let creds = try loadCredentialsFromStore(interactive: interactive)
         storeInCache(creds)
         return creds
@@ -266,10 +238,10 @@ enum ClaudeClient {
     /// Tries the credentials file first (no prompt), then the Keychain.
     private static func loadCredentialsFromStore(interactive: Bool) throws -> Credentials {
         let fileURL = credentialsFileURL()
-        if let data = try? Data(contentsOf: fileURL), let creds = try? parseCredentials(data, source: .file(fileURL)) {
+        if let data = try? Data(contentsOf: fileURL), let creds = try? parseCredentials(data) {
             return creds
         }
-        if let data = readKeychain(interactive: interactive), let creds = try? parseCredentials(data, source: .keychain) {
+        if let data = readKeychain(interactive: interactive), let creds = try? parseCredentials(data) {
             return creds
         }
         throw ClaudeError.notLoggedIn
@@ -342,7 +314,7 @@ enum ClaudeClient {
         return result as? Data
     }
 
-    private static func parseCredentials(_ data: Data, source: Source) throws -> Credentials {
+    private static func parseCredentials(_ data: Data) throws -> Credentials {
         let root = try JSONDecoder().decode(Root.self, from: data)
         guard let oauth = root.claudeAiOauth,
               let token = oauth.accessToken?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -351,10 +323,8 @@ enum ClaudeClient {
         let expiresAt = oauth.expiresAt.map { Date(timeIntervalSince1970: $0 / 1000.0) }
         return Credentials(
             accessToken: token,
-            refreshToken: oauth.refreshToken,
             expiresAt: expiresAt,
-            subscriptionType: oauth.subscriptionType,
-            source: source)
+            subscriptionType: oauth.subscriptionType)
     }
 
     private struct Root: Decodable {
@@ -363,7 +333,6 @@ enum ClaudeClient {
 
     private struct OAuth: Decodable {
         let accessToken: String?
-        let refreshToken: String?
         let expiresAt: Double?
         let subscriptionType: String?
     }
