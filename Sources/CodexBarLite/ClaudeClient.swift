@@ -219,30 +219,44 @@ enum ClaudeClient {
     }
 
     /// Returns cached credentials while they're fresh, otherwise reads the store
-    /// and caches the result. The cache means routine polls don't touch the
-    /// Keychain at all (each read is a chance to trip a macOS access prompt).
+    /// and caches the result. Each read is layered so the claude-owned Keychain
+    /// (the only thing that can trip a macOS access prompt) is touched as rarely
+    /// as possible: in-memory cache → our own persistent Keychain cache → the
+    /// credentials file → finally the claude Keychain.
     private static func loadCredentials(interactive: Bool) throws -> Credentials {
         if let cached = cachedCredentials() { return cached }
+        // Our own Keychain item survives app restarts and reads back without a
+        // prompt (we created it), so a fresh launch normally never has to read
+        // the claude-owned item. An expired blob still short-circuits the slow
+        // path; `fetch` notices the expiry and nudges the CLI to refresh.
+        if let creds = persistentCachedCredentials() {
+            storeInCache(creds)
+            return creds
+        }
         return try reloadFromStore(interactive: interactive)
     }
 
-    /// Reads the store directly (bypassing the cache) and refreshes the cache.
-    /// Used after a CLI nudge so we pick up the newly refreshed token.
+    /// Reads the source of truth (credentials file, then claude Keychain),
+    /// bypassing both caches, then refreshes them. Used after a CLI nudge so we
+    /// pick up the newly refreshed token.
     @discardableResult
     private static func reloadFromStore(interactive: Bool) throws -> Credentials {
-        let creds = try loadCredentialsFromStore(interactive: interactive)
+        let (creds, raw) = try loadCredentialsFromStore(interactive: interactive)
         storeInCache(creds)
+        savePersistentCache(raw)
         return creds
     }
 
-    /// Tries the credentials file first (no prompt), then the Keychain.
-    private static func loadCredentialsFromStore(interactive: Bool) throws -> Credentials {
+    /// Tries the credentials file first (no prompt), then the claude Keychain.
+    /// Returns the raw blob alongside the parsed creds so callers can persist it
+    /// verbatim into our own cache.
+    private static func loadCredentialsFromStore(interactive: Bool) throws -> (Credentials, Data) {
         let fileURL = credentialsFileURL()
         if let data = try? Data(contentsOf: fileURL), let creds = try? parseCredentials(data) {
-            return creds
+            return (creds, data)
         }
         if let data = readKeychain(interactive: interactive), let creds = try? parseCredentials(data) {
-            return creds
+            return (creds, data)
         }
         throw ClaudeError.notLoggedIn
     }
@@ -269,6 +283,61 @@ enum ClaudeClient {
         cacheLock.lock(); defer { cacheLock.unlock() }
         cachedCreds = creds
         cachedAt = Date()
+    }
+
+    // MARK: - Persistent (own) Keychain cache
+
+    /// A Keychain item *we* own, holding a verbatim copy of the last credentials
+    /// blob we read from the claude store. Because we created it, reading it back
+    /// never prompts, and unlike the in-memory cache it survives app restarts —
+    /// so a relaunch normally serves the token from here instead of re-reading
+    /// the claude-owned item (which is what was making macOS prompt repeatedly).
+    ///
+    /// This is a read-only *copy*; the claude CLI stays the sole owner that mints
+    /// and rotates the real token, so caching here can never break Claude Code.
+    private static let cacheKeychainService =
+        (Bundle.main.bundleIdentifier ?? "CodexBarLite") + ".claude-oauth-cache"
+    private static let cacheKeychainAccount = "claude"
+
+    private static func persistentCachedCredentials() -> Credentials? {
+        guard let data = readPersistentCache() else { return nil }
+        return try? parseCredentials(data)
+    }
+
+    /// No-UI read of our own item: it succeeds silently for us (the creating app)
+    /// and, should it ever not (e.g. after an ad-hoc re-sign changes our
+    /// identity), fails silently and we fall through rather than surprise-prompt.
+    private static func readPersistentCache() -> Data? {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: cacheKeychainService,
+            kSecAttrAccount as String: cacheKeychainAccount,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecReturnData as String: true,
+        ]
+        suppressPrompt(&query)
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return nil }
+        return result as? Data
+    }
+
+    /// Upsert the blob into our item. Best-effort: a failure just means the next
+    /// launch falls back to reading the claude store again.
+    private static func savePersistentCache(_ data: Data) {
+        let base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: cacheKeychainService,
+            kSecAttrAccount as String: cacheKeychainAccount,
+        ]
+        let update = SecItemUpdate(base as CFDictionary,
+                                   [kSecValueData as String: data] as CFDictionary)
+        guard update == errSecItemNotFound else { return }
+        var add = base
+        add[kSecValueData as String] = data
+        // Readable whenever the device is unlocked (so background polls work) and
+        // never synced off this Mac.
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        SecItemAdd(add as CFDictionary, nil)
     }
 
     // MARK: - Keychain prompt avoidance
