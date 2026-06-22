@@ -247,12 +247,16 @@ enum ClaudeClient {
         return creds
     }
 
-    /// Tries the credentials file first (no prompt), then the claude Keychain.
-    /// Returns the raw blob alongside the parsed creds so callers can persist it
-    /// verbatim into our own cache.
+    /// Tries the credentials file first (no prompt), then the claude Keychain via
+    /// the `security` CLI (no prompt — see `readKeychainViaSecurityCLI`), then a
+    /// direct Security.framework read as a last resort. Returns the raw blob
+    /// alongside the parsed creds so callers can persist it verbatim.
     private static func loadCredentialsFromStore(interactive: Bool) throws -> (Credentials, Data) {
         let fileURL = credentialsFileURL()
         if let data = try? Data(contentsOf: fileURL), let creds = try? parseCredentials(data) {
+            return (creds, data)
+        }
+        if let data = readKeychainViaSecurityCLI(), let creds = try? parseCredentials(data) {
             return (creds, data)
         }
         if let data = readKeychain(interactive: interactive), let creds = try? parseCredentials(data) {
@@ -381,6 +385,44 @@ enum ClaudeClient {
         var result: AnyObject?
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess else { return nil }
         return result as? Data
+    }
+
+    /// Reads the claude Keychain blob by shelling out to Apple's `security` tool
+    /// (`find-generic-password -w`).
+    ///
+    /// This is the key to *not* prompting. A direct in-process `SecItemCopyMatching`
+    /// is attributed to *us* — an ad-hoc-signed app whose code identity macOS
+    /// won't durably trust, so the "wants to access" grant never sticks and we get
+    /// re-prompted (notably whenever the token expires during sleep). Delegating
+    /// the read to `/usr/bin/security` attributes it to that stable, Apple-signed
+    /// binary instead, which reads the item without a prompt and, if ever asked,
+    /// keeps its grant. We never write through it — purely a read.
+    ///
+    /// Best-effort: returns nil on any failure (missing binary, timeout, non-zero
+    /// exit, locked keychain) so callers fall through to the in-process read. A
+    /// hard timeout guarantees a stuck child can't hang a poll. Output stays well
+    /// under the pipe buffer, so draining after exit can't deadlock.
+    private static func readKeychainViaSecurityCLI() -> Data? {
+        let securityPath = "/usr/bin/security"
+        guard FileManager.default.isExecutableFile(atPath: securityPath) else { return nil }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: securityPath)
+        process.arguments = ["find-generic-password", "-s", keychainService, "-w"]
+        let stdoutPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = nil
+        do { try process.run() } catch { return nil }
+
+        let deadline = Date().addingTimeInterval(2)
+        while process.isRunning, Date() < deadline { Thread.sleep(forTimeInterval: 0.02) }
+        if process.isRunning { process.terminate(); return nil }
+        guard process.terminationStatus == 0 else { return nil }
+
+        var data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        while let last = data.last, last == 0x0A || last == 0x0D { data.removeLast() }
+        return data.isEmpty ? nil : data
     }
 
     private static func parseCredentials(_ data: Data) throws -> Credentials {
