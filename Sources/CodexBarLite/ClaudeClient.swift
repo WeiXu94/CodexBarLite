@@ -12,8 +12,11 @@ import Security
 /// refresh token from here could leave `claude` holding a dead token, so the
 /// hard rule is: never do anything that can break Claude Code. When our token is
 /// expired or rejected, we ask the `claude` CLI to refresh *its own* Keychain
-/// token (`claude auth status` — read-only, non-interactive, no usage consumed)
-/// and then re-read the store. The CLI stays the sole owner of the credential.
+/// token by driving an interactive `/status` session through a PTY (the only
+/// thing that makes the CLI perform an authenticated request, and so refresh;
+/// `claude auth status` is just a local read that never refreshes). It consumes
+/// no usage. We then re-read the store. The CLI stays the sole owner of the
+/// credential.
 enum ClaudeClient {
     enum ClaudeError: LocalizedError {
         case notLoggedIn
@@ -125,11 +128,16 @@ enum ClaudeClient {
 
     // MARK: - Delegated refresh (the `claude` CLI owns its token)
 
-    /// Don't spawn `claude` on every poll: a token is good for hours, so one
-    /// nudge per this interval is plenty. Bypassed on a hard 401 (`force`).
-    private static let cliCooldown: TimeInterval = 5 * 60
+    /// Don't spawn `claude` on every poll: a token is good for hours. A nudge
+    /// that actually produced a fresh token backs off for `cliCooldownLong`; one
+    /// that didn't (e.g. the CLI was still launching, or hit a prompt) keeps
+    /// `cliCooldownShort` so the next poll retries soon instead of being stuck for
+    /// minutes. Bypassed on a hard 401 (`force`).
+    private static let cliCooldownLong: TimeInterval = 5 * 60
+    private static let cliCooldownShort: TimeInterval = 30
     private static let cliLock = NSLock()
     nonisolated(unsafe) private static var lastCLINudgeAt: Date?
+    nonisolated(unsafe) private static var currentCLICooldown: TimeInterval = 5 * 60
 
     /// Returns the freshest store credentials, having asked the CLI to refresh if
     /// needed. **Never refreshes in-app.** Falls back to `stale` when the CLI is
@@ -141,28 +149,47 @@ enum ClaudeClient {
             return latest
         }
         await nudgeCLIToRefresh(force: force)
-        return (try? reloadFromStore(interactive: interactive)) ?? stale
+        let latest = try? reloadFromStore(interactive: interactive)
+        // Only back off for the long interval once we can see a *fresh* token; if
+        // the nudge didn't refresh it, the short cooldown stands so the next poll
+        // retries soon rather than waiting minutes with a still-expired token.
+        if let latest, !latest.isExpired {
+            markCLINudgeRefreshed()
+        }
+        return latest ?? stale
     }
 
-    /// Runs `claude auth status` so the CLI validates and (if expired) refreshes
-    /// its own Keychain token. Read-only, non-interactive, consumes no usage.
-    /// Cooldown-gated; a no-op (returns false) when `claude` can't be found.
+    /// Drives an interactive `claude` `/status` session (see
+    /// `runInteractiveStatusViaPTY`) so the CLI performs an authenticated request
+    /// and refreshes *its own* Keychain token. Consumes no usage. Cooldown-gated;
+    /// a no-op (returns false) when a nudge ran too recently or `claude` can't be
+    /// found.
     @discardableResult
     private static func nudgeCLIToRefresh(force: Bool) async -> Bool {
         guard reserveCLINudge(force: force) else { return false }
         guard let claude = claudeBinaryURL() else { return false }
-        return await runProcess(claude, ["auth", "status"], timeout: 15)
+        return await runInteractiveStatusViaPTY(claude, timeout: 15)
     }
 
-    /// Claims a nudge slot under the cooldown. Synchronous so the lock is never
-    /// held across an `await`. Returns false when a nudge ran too recently.
+    /// Claims a nudge slot under the cooldown, reserving it with the *short*
+    /// cooldown; `markCLINudgeRefreshed` extends it to the long cooldown only if
+    /// the token actually came back fresh. Synchronous so the lock is never held
+    /// across an `await`. Returns false when a nudge ran too recently.
     private static func reserveCLINudge(force: Bool) -> Bool {
         cliLock.lock(); defer { cliLock.unlock() }
-        if !force, let last = lastCLINudgeAt, Date().timeIntervalSince(last) < cliCooldown {
+        if !force, let last = lastCLINudgeAt, Date().timeIntervalSince(last) < currentCLICooldown {
             return false
         }
         lastCLINudgeAt = Date()
+        currentCLICooldown = cliCooldownShort
         return true
+    }
+
+    /// Extend the cooldown to the long interval after a confirmed refresh.
+    private static func markCLINudgeRefreshed() {
+        cliLock.lock(); defer { cliLock.unlock() }
+        lastCLINudgeAt = Date()
+        currentCLICooldown = cliCooldownLong
     }
 
     /// Resolves the `claude` binary. GUI apps inherit a minimal PATH, so probe the
@@ -178,31 +205,134 @@ enum ClaudeClient {
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0.path) }
     }
 
-    /// Runs a short-lived helper, discarding its I/O, with a hard timeout so a
-    /// stuck child (e.g. one blocked on a Keychain prompt) can never hang a poll.
-    private static func runProcess(_ url: URL, _ arguments: [String], timeout: TimeInterval) async -> Bool {
+    /// Drives an interactive `claude` session through a pseudo-terminal, runs the
+    /// `/status` slash command, then tears the session down.
+    ///
+    /// This is the *only* thing that makes the CLI perform an authenticated
+    /// request — and therefore refresh its own expired OAuth token, writing the
+    /// rotated token back to its Keychain item. `claude auth status` is a local
+    /// read that never refreshes (it returns far faster than a network round-trip
+    /// takes); `/status` exists only inside an interactive session, so a real TTY
+    /// is required. `/status` is a status command, not a model prompt, so **no
+    /// usage is consumed.** Mirrors upstream's `ClaudeStatusProbe.touchOAuthAuthPath`.
+    ///
+    /// Output is discarded; the caller confirms success by re-reading the store.
+    /// A hard timeout plus a SIGKILL of the whole process group guarantee a stuck
+    /// child (e.g. one waiting on a prompt) can never hang a poll. Returns whether
+    /// the session launched.
+    private static func runInteractiveStatusViaPTY(_ binary: URL, timeout: TimeInterval) async -> Bool {
         await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-            let process = Process()
-            process.executableURL = url
-            process.arguments = arguments
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            process.standardInput = FileHandle.nullDevice
-
-            // Exactly one resume: terminationHandler fires once when the process
-            // exits (including after a timeout `terminate()`); if launch throws,
-            // the handler never fires and we resume in the catch instead.
-            process.terminationHandler = { continuation.resume(returning: $0.terminationStatus == 0) }
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(returning: false)
-                return
-            }
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak process] in
-                if process?.isRunning == true { process?.terminate() }
+            DispatchQueue.global(qos: .utility).async {
+                continuation.resume(returning: ptyStatusRefresh(binary, timeout: timeout))
             }
         }
+    }
+
+    private static func ptyStatusRefresh(_ binary: URL, timeout: TimeInterval) -> Bool {
+        // Baseline of the claude-owned blob so we can stop the moment the CLI
+        // rotates a fresh token into it (only a successful, *different* read counts).
+        let baseline = readKeychainViaSecurityCLI()
+
+        var primaryFD: Int32 = -1
+        var secondaryFD: Int32 = -1
+        var win = winsize(ws_row: 50, ws_col: 160, ws_xpixel: 0, ws_ypixel: 0)
+        guard openpty(&primaryFD, &secondaryFD, nil, nil, &win) == 0 else { return false }
+        _ = fcntl(primaryFD, F_SETFL, O_NONBLOCK)
+        let primary = FileHandle(fileDescriptor: primaryFD, closeOnDealloc: true)
+        let secondary = FileHandle(fileDescriptor: secondaryFD, closeOnDealloc: true)
+
+        let process = Process()
+        process.executableURL = binary
+        process.arguments = ["--allowed-tools", ""]
+        process.standardInput = secondary
+        process.standardOutput = secondary
+        process.standardError = secondary
+        let workdir = probeWorkingDirectory()
+        process.currentDirectoryURL = workdir
+        process.environment = refreshEnvironment(workingDirectory: workdir)
+
+        do {
+            try process.run()
+        } catch {
+            try? primary.close(); try? secondary.close()
+            return false
+        }
+        let pid = process.processIdentifier
+        setpgid(pid, pid)  // own process group so the SIGKILL below reaps children too
+
+        var scratch = [UInt8](repeating: 0, count: 8192)
+        let deadline = Date().addingTimeInterval(timeout)
+        let started = Date()
+        var lastStatusSend = Date.distantPast
+        var lastKeychainPoll = Date.distantPast
+        while process.isRunning, Date() < deadline {
+            // Drain the child's output so its PTY buffer can't fill and block it.
+            scratch.withUnsafeMutableBytes { _ = read(primaryFD, $0.baseAddress, $0.count) }
+
+            // The trailing Enter accepts the one-time "trust this folder" prompt
+            // for our own dir; re-sending `/status` makes it run once the session
+            // is ready, regardless of which arrives first.
+            let now = Date()
+            if now.timeIntervalSince(started) > 0.8, now.timeIntervalSince(lastStatusSend) > 1.0 {
+                lastStatusSend = now
+                writePTY(primaryFD, "/status\r")
+            }
+            if now.timeIntervalSince(lastKeychainPoll) > 1.2 {
+                lastKeychainPoll = now
+                if let baseline, let current = readKeychainViaSecurityCLI(), current != baseline {
+                    break  // token rotated into the Keychain — done early
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+
+        if process.isRunning {
+            let group = getpgid(pid)
+            kill(group > 0 ? -group : pid, SIGKILL)
+        }
+        process.waitUntilExit()
+        try? primary.close(); try? secondary.close()
+        return true
+    }
+
+    /// An isolated, persistent working directory for the refresh session so
+    /// launching `claude` picks up no project `CLAUDE.md` and can't touch the
+    /// user's workspace. The one-time "trust this folder" prompt for it is
+    /// auto-accepted by the Enter we send; the dir then stays trusted.
+    private static func probeWorkingDirectory() -> URL {
+        let fm = FileManager.default
+        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? fm.temporaryDirectory
+        let dir = base.appendingPathComponent(
+            (Bundle.main.bundleIdentifier ?? "CodexBarLite") + "/ClaudeRefresh", isDirectory: true)
+        do {
+            try fm.createDirectory(at: dir.appendingPathComponent(".claude", isDirectory: true),
+                                   withIntermediateDirectories: true)
+        } catch {
+            return fm.temporaryDirectory
+        }
+        let settings = dir.appendingPathComponent(".claude/settings.local.json")
+        if !fm.fileExists(atPath: settings.path) {
+            try? Data(#"{"disableDeepLinkRegistration":"disable"}"#.utf8).write(to: settings)
+        }
+        return dir
+    }
+
+    /// Environment for the refresh session: drop any inherited `ANTHROPIC_*` so
+    /// the CLI refreshes the OAuth credential we read (not an API-key override),
+    /// and enrich `PATH` since GUI apps inherit a minimal one.
+    private static func refreshEnvironment(workingDirectory: URL) -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        for key in env.keys where key.hasPrefix("ANTHROPIC_") { env.removeValue(forKey: key) }
+        env["PWD"] = workingDirectory.path
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let extras = ["\(home)/.local/bin", "\(home)/.claude/local",
+                      "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+        env["PATH"] = (extras + (env["PATH"].map { [$0] } ?? [])).joined(separator: ":")
+        return env
+    }
+
+    private static func writePTY(_ fd: Int32, _ string: String) {
+        Array(string.utf8).withUnsafeBytes { _ = write(fd, $0.baseAddress, $0.count) }
     }
 
     // MARK: - Credentials
